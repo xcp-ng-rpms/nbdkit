@@ -1,7 +1,13 @@
+# XCP-ng disables some features not yet supported
+%bcond_with libvirt  # Disabled
+%bcond_with ruby  # Disabled
+%bcond_with tests  # Disabled
+
 %global _hardened_build 1
 
 %ifarch aarch64 %{arm} %{ix86} x86_64 ppc %{power64}
-%global have_libguestfs 1
+# XCP-ng does not support this package yet
+%global have_libguestfs 0
 %endif
 
 # Architectures where the complete test suite must pass.
@@ -27,7 +33,7 @@
 
 Name:           nbdkit
 Version:        1.8.0
-Release:        4%{?dist}
+Release:        4.1%{?dist}
 Summary:        NBD server
 
 License:        BSD
@@ -68,7 +74,9 @@ BuildRequires:  libselinux-devel
 %if 0%{?have_libguestfs}
 BuildRequires:  libguestfs-devel
 %endif
+%if %{with libvirt}
 BuildRequires:  libvirt-devel
+%endif
 BuildRequires:  xz-devel
 BuildRequires:  zlib-devel
 BuildRequires:  libcurl-devel
@@ -83,14 +91,17 @@ BuildRequires:  python3-devel
 # http://caml.inria.fr/mantis/view.php?id=6693
 BuildRequires:  ocaml >= 4.02.2
 %endif
+%if %{with ruby}
 BuildRequires:  ruby-devel
+%endif
 %if 0%{verify_tarball_signature}
 BuildRequires: gnupg2
 %endif
 
 # Only for running the test suite:
 BuildRequires:  /usr/bin/certtool
-BuildRequires:  /usr/bin/qemu-img
+# XCP-ng qemu-img from blktab can't be used
+#BuildRequires:  /usr/bin/qemu-img
 BuildRequires:  /usr/bin/socat
 BuildRequires:  /usr/sbin/ss
 
@@ -344,13 +355,15 @@ rm -rf $RPM_BUILD_ROOT%{_sysconfdir}/bash_completion.d
 # add these back later if there is customer demand.
 rm $RPM_BUILD_ROOT%{_libdir}/%{name}/plugins/nbdkit-floppy-plugin.so
 rm $RPM_BUILD_ROOT%{_mandir}/man1/nbdkit-floppy-plugin.1*
-rm $RPM_BUILD_ROOT%{_libdir}/%{name}/plugins/nbdkit-iso-plugin.so
-rm $RPM_BUILD_ROOT%{_mandir}/man1/nbdkit-iso-plugin.1*
+# XCP-ng ignores non build plugins
+rm -f $RPM_BUILD_ROOT%{_libdir}/%{name}/plugins/nbdkit-iso-plugin.so
+rm -f $RPM_BUILD_ROOT%{_mandir}/man1/nbdkit-iso-plugin.1*
 rm $RPM_BUILD_ROOT%{_libdir}/%{name}/plugins/nbdkit-sh-plugin.so
 rm $RPM_BUILD_ROOT%{_mandir}/man3/nbdkit-sh-plugin.3*
 
 
 %check
+%if %{with tests}
 # Workaround for broken libvirt (RHBZ#1138604).
 mkdir -p $HOME/.cache/libvirt
 
@@ -362,6 +375,7 @@ make check -j1 || {
     cat tests/test-suite.log
     exit 1
   }
+%endif
 
 
 %files
@@ -451,6 +465,10 @@ make check -j1 || {
 
 
 %changelog
+* Thu Sep 17 2026 Philippe Coval <philippe.coval@vates.tech> - 1.8.0-4.1
+- Ported to XCP-ng without unsupported deps (qemu, libguestfs) and bypass tests
+- Rebuild with updated gnutls
+
 * Fri Apr  3 2020 Richard W.M. Jones <rjones@redhat.com> - 1.8.0-4
 - Remove workaround for ancient qemu-io
   resolves: rhbz#1820275
