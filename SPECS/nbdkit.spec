@@ -33,7 +33,7 @@
 
 Name:           nbdkit
 Version:        1.8.0
-Release:        4.1%{?dist}
+Release:        4.1~XCPNG3564.1%{?dist}
 Summary:        NBD server
 
 License:        BSD
