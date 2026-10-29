@@ -1,0 +1,213 @@
+From 611f931d75feaf516da8097e6a69ff084b4ca38c Mon Sep 17 00:00:00 2001
+From: "Richard W.M. Jones" <rjones@redhat.com>
+Date: Wed, 11 Sep 2019 09:47:30 +0100
+Subject: [PATCH 2/2] server: Wait until handshake complete before calling
+ .open callback
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently we call the plugin .open callback as soon as we receive a
+TCP connection:
+
+  $ nbdkit -fv --tls=require --tls-certificates=tests/pki null \
+           --run "telnet localhost 10809"
+  [...]
+  Trying ::1...
+  Connected to localhost.
+  Escape character is '^]'.
+  nbdkit: debug: accepted connection
+  nbdkit: debug: null: open readonly=0       ◀ NOTE
+  nbdkit: null[1]: debug: newstyle negotiation: flags: global 0x3
+  NBDMAGICIHAVEOPT
+
+In plugins such as curl, guestfs, ssh, vddk and others we do a
+considerable amount of work in the .open callback (such as making a
+remote connection or launching an appliance).  Therefore we are
+providing an easy Denial of Service / Amplification Attack for
+unauthorized clients to cause a lot of work to be done for only the
+cost of a simple TCP 3 way handshake.
+
+This commit moves the call to the .open callback after the NBD
+handshake has mostly completed.  In particular TLS authentication must
+be complete before we will call into the plugin.
+
+It is unlikely that there are plugins which really depend on the
+current behaviour of .open (which I found surprising even though I
+guess I must have written it).  If there are then we could add a new
+.connect callback or similar to allow plugins to get control at the
+earlier point in the connection.
+
+After this change you can see that the .open callback is not called
+from just a simple TCP connection:
+
+  $ ./nbdkit -fv --tls=require --tls-certificates=tests/pki null \
+             --run "telnet localhost 10809"
+  [...]
+  Trying ::1...
+  Connected to localhost.
+  Escape character is '^]'.
+  nbdkit: debug: accepted connection
+  nbdkit: null[1]: debug: newstyle negotiation: flags: global 0x3
+  NBDMAGICIHAVEOPT
+  xx
+  nbdkit: null[1]: debug: newstyle negotiation: client flags: 0xd0a7878
+  nbdkit: null[1]: error: client requested unknown flags 0xd0a7878
+  Connection closed by foreign host.
+  nbdkit: debug: null: unload plugin
+
+Signed-off-by: Richard W.M. Jones <rjones@redhat.com>
+(cherry picked from commit c05686f9577fa91b6a3a4d8c065954ca6fc3fd62)
+(cherry picked from commit e06cde00659ff97182173d0e33fff784041bcb4a)
+---
+ src/connections.c | 83 +++++++++++++++++++++++++++----------------------------
+ 1 file changed, 40 insertions(+), 43 deletions(-)
+
+diff --git a/src/connections.c b/src/connections.c
+index e1ffeff..6e7c080 100644
+--- a/src/connections.c
++++ b/src/connections.c
+@@ -246,12 +246,6 @@ _handle_single_connection (int sockin, int sockout)
+   if (!conn)
+     goto done;
+ 
+-  lock_request (conn);
+-  r = backend->open (backend, conn, readonly);
+-  unlock_request (conn);
+-  if (r == -1)
+-    goto done;
+-
+   /* NB: because of an asynchronous exit backend can be set to NULL at
+    * just about any time.
+    */
+@@ -261,17 +255,11 @@ _handle_single_connection (int sockin, int sockout)
+     plugin_name = "(unknown)";
+   threadlocal_set_name (plugin_name);
+ 
+-  /* Prepare (for filters), called just after open. */
+-  lock_request (conn);
+-  if (backend)
+-    r = backend->prepare (backend, conn);
+-  else
+-    r = 0;
+-  unlock_request (conn);
+-  if (r == -1)
+-    goto done;
+-
+-  /* Handshake. */
++  /* NBD handshake.
++   *
++   * Note that this calls the backend .open callback when it is safe
++   * to do so (eg. after TLS authentication).
++   */
+   if (negotiate_handshake (conn) == -1)
+     goto done;
+ 
+@@ -408,12 +396,43 @@ free_connection (struct connection *conn)
+   free (conn);
+ }
+ 
++/* Common code used by oldstyle and newstyle protocols to:
++ *
++ * - call the backend .open method
++ *
++ * - get the export size
++ *
++ * - compute the eflags (same between oldstyle and newstyle
++ *   protocols)
++ *
++ * The protocols must defer this as late as possible so that
++ * unauthorized clients can't cause unnecessary work in .open by
++ * simply opening a TCP connection.
++ */
+ static int
+-compute_eflags (struct connection *conn, uint16_t *flags)
++protocol_common_open (struct connection *conn,
++                      uint64_t *exportsize, uint16_t *flags)
+ {
++  int64_t size;
+   uint16_t eflags = NBD_FLAG_HAS_FLAGS;
+   int fl;
+ 
++  if (backend->open (backend, conn, readonly) == -1)
++    return -1;
++
++  /* Prepare (for filters), called just after open. */
++  if (backend->prepare (backend, conn) == -1)
++    return -1;
++
++  size = backend->get_size (backend, conn);
++  if (size == -1)
++    return -1;
++  if (size < 0) {
++    nbdkit_error (".get_size function returned invalid value "
++                  "(%" PRIi64 ")", size);
++    return -1;
++  }
++
+   fl = backend->can_write (backend, conn);
+   if (fl == -1)
+     return -1;
+@@ -463,6 +482,7 @@ compute_eflags (struct connection *conn, uint16_t *flags)
+     conn->is_rotational = 1;
+   }
+ 
++  *exportsize = size;
+   *flags = eflags;
+   return 0;
+ }
+@@ -471,7 +491,6 @@ static int
+ _negotiate_handshake_oldstyle (struct connection *conn)
+ {
+   struct old_handshake handshake;
+-  int64_t r;
+   uint64_t exportsize;
+   uint16_t gflags, eflags;
+ 
+@@ -483,21 +502,11 @@ _negotiate_handshake_oldstyle (struct connection *conn)
+     return -1;
+   }
+ 
+-  r = backend->get_size (backend, conn);
+-  if (r == -1)
++  if (protocol_common_open (conn, &exportsize, &eflags) == -1)
+     return -1;
+-  if (r < 0) {
+-    nbdkit_error (".get_size function returned invalid value "
+-                  "(%" PRIi64 ")", r);
+-    return -1;
+-  }
+-  exportsize = (uint64_t) r;
+   conn->exportsize = exportsize;
+ 
+   gflags = 0;
+-  if (compute_eflags (conn, &eflags) < 0)
+-    return -1;
+-
+   debug ("oldstyle negotiation: flags: global 0x%x export 0x%x",
+          gflags, eflags);
+ 
+@@ -607,19 +616,7 @@ send_newstyle_option_reply_info_export (struct connection *conn,
+ static int
+ finish_newstyle_options (struct connection *conn)
+ {
+-  int64_t r;
+-
+-  r = backend->get_size (backend, conn);
+-  if (r == -1)
+-    return -1;
+-  if (r < 0) {
+-    nbdkit_error (".get_size function returned invalid value "
+-                  "(%" PRIi64 ")", r);
+-    return -1;
+-  }
+-  conn->exportsize = (uint64_t) r;
+-
+-  if (compute_eflags (conn, &conn->eflags) < 0)
++  if (protocol_common_open (conn, &conn->exportsize, &conn->eflags) == -1)
+     return -1;
+ 
+   debug ("newstyle negotiation: flags: export 0x%x", conn->eflags);
+-- 
+1.8.3.1
+
